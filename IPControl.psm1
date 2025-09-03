@@ -1,6 +1,8 @@
-﻿#Using Module .\Classes.psm1
+﻿Using Module .\Classes.psm1
 $InformationPreference = 'Continue'
 $ErrorActionPreference = 'Stop'
+
+#Region = Authentication Functions =
 
 Function Connect-IPControl {
     <#
@@ -46,13 +48,13 @@ Function Connect-IPControl {
     Connect-IPControl -Instance 'ipcontrol.contoso.com'
 
     .EXAMPLE
-    Connect with a secure password that you enter beforehand.
-    
+    Connect with a secure password that you genereated beforehand.
+
     $secure_pass = Read-Host -AsSecureString
     Connect-IPControl -Instance 'ipcontrol.contoso.com' -User 'username' -SecurePass $secure_pass
 
     .EXAMPLE
-    Connect with an access token.
+    Connect via access token.
 
     Connect-IPControl -Instance 'ipcontrol.contoso.com' -AccessToken 'ey...'
 
@@ -60,7 +62,7 @@ Function Connect-IPControl {
 
     #>
     [OutputType([string])]
-    [CmdletBinding(DefaultParameterSetName = 'Credential')]
+    [CmdletBinding(DefaultParameterSetName = 'Default')]
     Param(
         [Parameter(Mandatory = $true)]
         [string]$Instance,
@@ -314,11 +316,77 @@ Function Connect-IPControl {
             Break
         }
         [string]$AccessToken = $auth_response.access_token
+        If ($AccessToken.Length -eq 0) {
+            Write-Warning -Message "Somehow the received access token was empty!"
+            Break
+        }
     }
-    [datetime]$current_date = Get-Date
-    [datetime]$expiration_date = $current_date.AddHours(1)
-    [hashtable]$header = @{'Authorization' = "Bearer $AccessToken"; }
+    # Note - it is neccessary to extract the user name and expiration date from the access token
+    [string]$access_token_info_encoded = $AccessToken -split '\.' | Select-Object -Skip 1 -First 1
+    If ($access_token_info_encoded -notmatch '^[A-Za-z0-9+/]+={0,2}$') {
+        Write-Warning -Message "Somehow the access token was not in the expected format."
+        Break
+    }
+    [int32]$access_token_info_encoded_length = $access_token_info_encoded.Length
+    [int32]$access_token_base64_divisor = $access_token_info_encoded_length % 4
+    If ($access_token_base64_divisor -eq 1) {
+        Write-Warning -Message "Somehow this string ($access_token_info_encoded) doesn't obey the laws of Base64 encoding!"
+        Break
+    }
+    Switch ($access_token_base64_divisor) {
+        3 { [string]$base64_padding = '=' }
+        2 { [string]$base64_padding = '==' }
+    }
+    [string]$access_token_info_encoded += $base64_padding
+    $Error.Clear()
+    Try {
+        [string]$access_token_info_json = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($access_token_info_encoded))
+    }
+    Catch {
+        [string]$Message = $_.Exception.Message
+        Write-Warning -Message "Somehow the details from this encoded token could not be converted from Base64 format: $AccessToken due to $Message"
+        Break
+    }
+    $Error.Clear()
+    Try {
+        [PSCustomObject]$access_token_object = $access_token_info_json | ConvertFrom-JSON
+    }
+    Catch {
+        [string]$Message = $_.Exception.Message
+        Write-Warning -Message "ConvertFrom-JSON failed to convert the decoded access token json string due to [$Message]."
+        Break
+    }
+    [string]$User = $access_token_object.adminLogin
+    If ($User.Length -eq 0) {
+        Write-Warning -Message "Somehow the user name to which this token was issued could not be derived."
+        Break
+    }
+    [int64]$expiration_date_unix = $access_token_object.exp
+    If ($expiration_date_unix -eq 0) {
+        Write-Warning -Message "Somehow the expiration date of this token could not be derived."
+        Break
+    }
+    $Error.Clear()
+    Try {
+        [System.TimeZoneInfo]$timezone = Get-TimeZone
+    }
+    Catch {
+        [string]$Message = $_.Exception.Message
+        Write-Warning -Message "Get-TimeZone failed to get the local time zone due to [$Message]."
+        Break
+    }
+    [boolean]$dst = (Get-Date).IsDaylightSavingTime()
+    If ($dst -eq $true) {
+        [System.TimeSpan]$utc_offset = ($timezone.BaseUtcOffset + (New-TimeSpan -Minutes 60))
+    }
+    Else {
+        [System.TimeSpan]$utc_offset = $timezone.BaseUtcOffset
+    }
+    [datetime]$expiration_date_utc = (Get-Date -Date '1970-01-01').AddSeconds($expiration_date_unix)
+    [datetime]$expiration_date = $expiration_date_utc + $utc_offset
+    [hashtable]$header = @{'Authorization' = "Bearer $AccessToken"; 'Accept' = 'application/json' }
     [hashtable]$ipcontrol_session = @{}
+    $ipcontrol_session.Add('TokenInfo', $access_token_object)
     $ipcontrol_session.Add('User', $User)
     $ipcontrol_session.Add('Instance', $Instance)
     If ($NotSecure -eq $true) {
@@ -342,11 +410,773 @@ Function Connect-IPControl {
     }
     Write-Verbose -Message 'Global variable $ipcontrol_session.header has been set. Refer to this as your authentication header.'
     $ipcontrol_session.Add('Protocol', $Protocol)
-    [PSCustomObject]$ipcontrol_session_display = [PSCustomObject]@{ Protocol = $protocol; Instance = $Instance; Port = $Port; TokenExpires = $expiration_date; User = $User; AccessToken = ($AccessToken.SubString(0, 5) + '..' + $AccessToken.SubString(($AccessToken.Length - 5), 5)) }
+    [PSCustomObject]$ipcontrol_session_display = [PSCustomObject]@{ Protocol = $protocol; Instance = $Instance; Port = $Port; TokenExpires = $expiration_date; User = $User; AccessToken = ($AccessToken.SubString(0, 4) + '..' + $AccessToken.SubString(($AccessToken.Length - 5), 5)) }
     If ($Quiet -ne $true) {
         Format-Table -InputObject $ipcontrol_session_display -AutoSize -Wrap
     }
 }
+
+Function Confirm-IPControlSession {
+    [OutputType([boolean])]
+    [CmdletBinding()]
+    Param(
+        [Parameter(Mandatory = $false)]
+        [switch]$Quiet
+    )
+    [datetime]$current_date = Get-Date
+    [datetime]$ipcontrol_session_expiration_date = $ipcontrol_session.ExpirationDate
+    If ($current_date -lt $ipcontrol_session_expiration_date) {
+        Return $true
+    }
+    Else {
+        [timespan]$token_elapsed_duration = $current_date - $ipcontrol_session_expiration_date
+        [int32]$token_minutes_elapsed = $token_elapsed_duration.TotalMinutes
+        If ($token_minutes_elapsed -gt 1) {
+            Write-Warning -Message "Your current IPControl token expired about $token_minutes_elapsed minutes ago"
+        }
+        ElseIf ($token_minutes_elapsed -eq 1) {
+            Write-Warning -Message "Your current IPControl token expired about 1 minute ago"
+        }
+        Else {
+            Write-Warning -Message "Your current IPControl token expired less than 1 minute ago"
+        }
+        Return $false
+    }
+}
+
+#EndRegion
+
+#Region = Object Functions =
+
+#region - Containers
+
+Function Get-IPControlContainer {
+    <#
+
+    .SYNOPSIS
+    Gets a Container from an IPControl instance
+
+    .DESCRIPTION
+    Gets a Container from an IPControl instance
+
+    .PARAMETER Name
+    String representing the Name of the Container to look up.
+
+    .PARAMETER Id
+    Int64 representing the Id of the Container to look up.
+
+    .PARAMETER Device
+    [Device] object from which the Container name can be derived.
+
+    .PARAMETER Parent
+    Switch that will cause of the parent of the target Container to be returned instead of the target Container
+
+    .INPUTS
+    Container names and [Device] objects can be sent across the pipeline.
+
+    .OUTPUTS
+    The reponse is provided in a [Container] class object.
+
+    .EXAMPLE
+    Gets a Container by name
+
+    Get-IPControlContainer -Name '/IPControl/Contoso/Container1'
+
+    .EXAMPLE
+    Gets a Container by its IPControl Id
+
+    Get-IPControlContainer -Id 39495
+
+    .EXAMPLE
+    Gets the parent Container of a Container by name
+
+    Get-IPControlContainer -Name '/IPControl/Contoso/Container1' -Parent
+
+    .NOTES
+    You must use Connect-IPControl to establish a connection and define the global session variable
+
+    #>
+    [OutputType([Container])]
+    [CmdletBinding( DefaultParameterSetName = 'Name')]
+    Param(
+        [Parameter(Mandatory = $true, ParameterSetName = 'Name', ValueFromPipeline = $true, HelpMessage = 'e.g. IPControl/My Company/etc/etc')]
+        [string]$Name,
+        [Parameter(Mandatory = $true, ParameterSetName = 'Id', HelpMessage = 'This will be a number')]
+        [int64]$Id,
+        [Parameter(Mandatory = $true, ParameterSetName = 'Device', ValueFromPipeline = $true)]
+        [Device]$Device,
+        [Parameter(Mandatory = $false)]
+        [switch]$Parent
+    )
+    Begin {
+        If ((Confirm-IPControlSession -Quiet) -ne $true) {
+            Write-Warning -Message "Please use Connect-IPControl to establish a new session"
+            Break
+        }
+        [string]$Method = 'GET'
+        [hashtable]$parameters = @{}
+        $parameters.Add('Method', $Method)
+    }
+    Process {
+        If ($_.container.Length -gt 0) {
+            [string]$Name = $_.container
+        }
+        ElseIf ($_.Length -gt 0) {
+            [string]$Name = $_
+        }
+        [System.Collections.Specialized.OrderedDictionary]$BodyMetaData = [System.Collections.Specialized.OrderedDictionary]@{}
+        If ($Name.Length -gt 0) {
+            [string]$Command = '/Gets/getContainerByName'
+            $BodyMetaData.Add('containerName', $Name)
+        }
+        ElseIf ($Id -gt 0) {
+            [string]$Command = '/Gets/getContainerById'
+            $BodyMetaData.Add('containerId', $Id)
+        }
+        Else {
+            Write-Warning -Message "Somehow it was not possible to determine the intended command"
+            Break
+        }
+        [string]$Body = ConvertTo-QueryString -InputObject $BodyMetaData
+        If ($null -eq $parameters.Body) {
+            $parameters.Add('Body', $Body)
+        }
+        Else {
+            $parameters.Body = $Body
+        }
+        If ($null -eq $parameters.Command) {
+            $parameters.Add('Command', $Command)
+        }
+        Else {
+            $parameters.Command = $Command
+        }
+        $Error.Clear()
+        Try {
+            [PSCustomObject]$results = Invoke-IPControlAPI @parameters
+        }
+        Catch {
+            [string]$Message = $_.Exception.Message
+            Write-Warning -Message "Invoke-IPControlAPI failed to execute [$Command] due to [$Message]."
+            Break
+        }
+        $Error.Clear()
+        Try {
+            [Container]$ipcontrol_container = $results | Select-Object -First 1
+        }
+        Catch {
+            [string]$Message = $_.Exception.Message
+            Write-Warning -Message "Failed to formulate the response from the API into a [Container] object under Get-IPControlContainer due to [$Message]."
+            Break
+        }
+        If ($Parent -ne $true) {
+            Return $ipcontrol_container
+        }
+        Else {
+            [string]$parent_container_name = $ipcontrol_container.parentName
+            If ($parent_container_name.Length -eq 0) {
+                Write-Warning -Message "Somehow there is no parent container for [$Name]. Is this expected?"
+                Break
+            }
+            [string]$Command = '/Gets/getContainerByName'
+            $parameters.Command = $Command
+            [System.Collections.Specialized.OrderedDictionary]$BodyMetaData = [System.Collections.Specialized.OrderedDictionary]@{}
+            $BodyMetaData.Add('containerName', $parent_container_name)
+            [string]$Body = ConvertTo-QueryString -InputObject $BodyMetaData
+            $parameters.Body = $Body
+            $Error.Clear()
+            Try {
+                [PSCustomObject]$results = Invoke-IPControlAPI @parameters
+            }
+            Catch {
+                [string]$Message = $_.Exception.Message
+                Write-Warning -Message "Invoke-IPControlAPI failed to execute [$Command] on the specified Parent Container due to [$Message]."
+                Break
+            }
+            $Error.Clear()
+            Try {
+                [Container]$ipcontrol_parent_container = $results | Select-Object -First 1
+            }
+            Catch {
+                [string]$Message = $_.Exception.Message
+                Write-Warning -Message "Failed to formulate the response from the API into a [Container] (parent) object under Get-IPControlContainer due to [$Message]."
+                Break
+            }
+            Return $ipcontrol_parent_container
+        }
+    }
+    End {
+
+    }
+}
+
+#EndRegion
+
+#region - Devices
+
+Function Get-IPControlDevice {
+    <#
+
+    .SYNOPSIS
+    Gets a Device from an IPControl instance
+
+    .DESCRIPTION
+    Gets a Device from an IPControl instance
+
+    .PARAMETER IPAddress
+    String representing the IP address of the Device to look up (e.g. '1.2.3.4')
+
+    .PARAMETER Container
+    Optional string with the name of the Container for the Device. This parameter may only be used with -IPAddress and is only required when the IP address exists in multiple places within the instance (i.e. overlapping address space)
+
+    .PARAMETER Hostname
+    String representing the Hostname of the Device to look up (e.g. 'servername.contoso.com')
+
+    .PARAMETER MACAddress
+    String representing the MAC address (a.k.a. Hardware address) of the Device to look up. (e.g. 'B8610CAE9619')
+
+    .PARAMETER Id
+    Int64 representing the Id of the Device to look up. This will be a number.
+
+    .INPUTS
+    IP addresses can be sent across the pipeline.
+
+    .OUTPUTS
+    The reponse is provided in a [Device] class object.
+
+    .EXAMPLE
+    Gets a single Device by its IP address
+
+    Get-IPControlDevice -IPAddress '1.2.3.4'
+
+    .EXAMPLE
+    Gets a single Device by its IP address and its Container name because the IP is in an overlapping network space so the Container name is required to distinguish it.
+
+    Get-IPControlDevice -IPAddress '1.2.3.4' -Container 'IPControl/My Company/etc/etc'
+
+    .EXAMPLE
+    Gets a single Device by its hardware address (a.k.a. MAC address)
+
+    Get-IPControlDevice -MACAddress 'B8610CAE9619'
+
+    .EXAMPLE
+    Gets a single Device by its hostname
+
+    Get-IPControlDevice -Hostname 'Printer_10-226-124-10'
+
+    .EXAMPLE
+    Gets a single Device by its IPControl Id
+
+    Get-IPControlDevice -Id 123456
+
+    .EXAMPLE
+    Uses the pipeline to get a series of Devices by their IP addresses
+
+    '1.2.3.4', '2.3.4.5' | Get-IPControlDevice
+
+    .NOTES
+    An "IP Address" in IPControl is known as a "Device".
+
+    You must use Connect-IPControl to establish a connection and define the global session variable
+
+    If the Container name is specified and it doesn't exist then the lookup will fail with 400 Bad Request.
+
+    #>
+    [OutputType([Container])]
+    [CmdletBinding( DefaultParameterSetName = 'IPAddress' )]
+    Param(
+        [ValidateScript({ $_ -match '^[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}$' })]
+        [Parameter(Mandatory = $true, ParameterSetName = 'IPAddress', ValueFromPipeline = $true, HelpMessage = 'e.g. 1.2.3.4')]
+        [string]$IPAddress,
+        [Parameter(Mandatory = $false, ParameterSetName = 'IPAddress', ValueFromPipeline = $true, HelpMessage = 'e.g. IPControl/My Company/etc/etc')]
+        [string]$Container,
+        [Parameter(Mandatory = $true, ParameterSetName = 'Hostname', HelpMessage = 'e.g. server.contoso.com')]
+        [string]$Hostname,
+        [ValidateScript({ $_ -cmatch '^[A-F0-9]{12}$' })]
+        [Parameter(Mandatory = $true, ParameterSetName = 'HWAddress', HelpMessage = 'e.g. B8610CAE9619')]
+        [string]$MACAddress,
+        [Parameter(Mandatory = $true, ParameterSetName = 'Id', HelpMessage = 'This will be a number')]
+        [int64]$Id
+    )
+    Begin {
+        If ((Confirm-IPControlSession -Quiet) -ne $true) {
+            Write-Warning -Message "Please use Connect-IPControl to establish a new session"
+            Break
+        }
+        [string]$Method = 'GET'
+        [hashtable]$parameters = @{}
+        $parameters.Add('Method', $Method)
+    }
+    Process {
+        If ($_ -match '^[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}$') {
+            [string]$IPAddress = $_
+        }
+        [System.Collections.Specialized.OrderedDictionary]$BodyMetaData = [System.Collections.Specialized.OrderedDictionary]@{}
+        If ($IPAddress.Length -gt 0) {
+            [string]$Command = '/Gets/getDeviceByIPAddr'
+            $BodyMetaData.Add('ipAddress', $IPAddress)
+            If ($Container.Length -gt 0) {
+                $BodyMetaData.Add('container', $Container)
+            }
+        }
+        ElseIf ($Hostname.Length -gt 0) {
+            [string]$Command = '/Gets/getDeviceByHostname'
+            $BodyMetaData.Add('hostname', $Hostname)
+        }
+        ElseIf ($MACAddress.Length -gt 0) {
+            [string]$Command = '/Gets/getDeviceByMACAddress'
+            $BodyMetaData.Add('macAddress', $MACAddress)
+        }
+        ElseIf ($Id -gt 0) {
+            [string]$Command = '/Gets/getDeviceById'
+            $BodyMetaData.Add('id', $Id)
+        }
+        Else {
+            Write-Warning -Message "Somehow it was not possible to determine the intended command"
+            Break
+        }
+        [string]$Body = ConvertTo-QueryString -InputObject $BodyMetaData
+        If ($null -eq $parameters.Body) {
+            $parameters.Add('Body', $Body)
+        }
+        Else {
+            $parameters.Body = $Body
+        }
+        If ($null -eq $parameters.Command) {
+            $parameters.Add('Command', $Command)
+        }
+        Else {
+            $parameters.Command = $Command
+        }
+        $Error.Clear()
+        Try {
+            [PSCustomObject]$results = Invoke-IPControlAPI @parameters
+        }
+        Catch {
+            [string]$Message = $_.Exception.Message
+            Write-Warning -Message "Invoke-IPControlAPI failed to execute [$Command] due to [$Message]."
+            Break
+        }
+        $Error.Clear()
+        Try {
+            [Device]$ipcontrol_device = $results | Select-Object -First 1
+        }
+        Catch {
+            [string]$Message = $_.Exception.Message
+            Write-Warning -Message "Failed to formulate the response from the API into a [Device] object under Get-IPControlDevice due to [$Message]."
+            Break
+        }
+        Return $ipcontrol_device
+    }
+    End {
+
+    }
+}
+
+Function Remove-IPControlDevice {
+    <#
+
+    .SYNOPSIS
+    Remove a Device (and its records) from an IPControl instance
+
+    .DESCRIPTION
+    Remove a Device (and its records) from an IPControl instance
+
+    .PARAMETER Device
+    [Device] object representing the Device to get deleted. Use Get-IPControlDevice to retrieve these.
+
+    .PARAMETER Force
+    Force the change without confirmation. This is equivalent to -Confirm:$false
+
+    .PARAMETER Quiet
+    Suppress the output informational message when the delete operation is successful.
+
+    .INPUTS
+    Device objects from Get-IPControlDevice can be sent across the pipeline.
+
+    .OUTPUTS
+    An informational message will be written to the host if the delete operation is successful.
+
+    .EXAMPLE
+    Forcibly and quietly removes a Device with the IP address of '1.2.3.4' while using the pipeline.
+
+    Get-IPControlDevice -IPAddress '1.2.3.4' | Remove-IPControlDevice -Force -Quiet
+
+    .EXAMPLE
+    Removes a Device with the IP address of '1.2.3.4' without using the pipeline.
+
+    Remove-IPControlDevice -Device (Get-IPControlDevice -IPAddress '1.2.3.4')
+
+    .NOTES
+    You must use Connect-IPControl to establish a connection and define the global session variable
+
+    The Container name is always included in the request
+
+    #>
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+    Param(
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
+        [Device]$Device,
+        [Parameter(Mandatory = $false)]
+        [switch]$Force,
+        [Parameter(Mandatory = $false)]
+        [switch]$Quiet
+    )
+    Begin {
+        If ((Confirm-IPControlSession -Quiet) -ne $true) {
+            Write-Warning -Message "Please use Connect-IPControl to establish a new session"
+            Break
+        }
+        [string]$Method = 'DELETE'
+        [string]$Command = '/Deletes/deleteDevice'
+        [hashtable]$parameters = @{}
+        $parameters.Add('Method', $Method)
+        $parameters.Add('Command', $Command)
+        $parameters.Add('ContentType', 'application/json')
+    }
+    Process {
+        If ($_ -is [Device]) {
+            [Device]$Device = $_
+        }
+        [string]$device_ip_address = $Device.ipAddress
+        [string]$device_container = $Device.container
+        If ($device_ip_address.Length -eq 0) {
+            Write-Warning -Message "Somehow the IP address of the Device is empty"
+            Break
+        }
+        ElseIf ($device_container.Length -eq 0) {
+            Write-Warning -Message "Somehow the Container of the Device is empty"
+            Break
+        }
+        [hashtable]$inpDev = @{}
+        $inpDev.Add('ipAddress', $device_ip_address )
+        $inpDev.Add('container', $device_container )
+        [string]$Body = @{'inpDev' = $inpDev } | ConvertTo-Json -Compress
+        If ($null -eq $parameters.Body) {
+            $parameters.Add('Body', $Body)
+        }
+        Else {
+            $parameters.Body = $Body
+        }
+        If (($Force -eq $true) -or ($PSCmdlet.ShouldProcess("$($device_ip_address)")) -eq $true) {
+            $Error.Clear()
+            Try {
+                [string]$results = Invoke-IPControlAPI @parameters
+            }
+            Catch {
+                [string]$Message = $_.Exception.Message
+                Write-Warning -Message "Invoke-IPControlAPI failed to execute [$Command] due to [$Message]."
+                Break
+            }
+            If ($results.Length -gt 0) {
+                If ($Quiet -ne $true) {
+                    Return $results
+                }
+            }
+            Else {
+                Write-Warning -Message "The response from [$Command] was empty. Something might be wrong..."
+            }
+        }
+    }
+    End {
+
+    }
+}
+
+#endregion
+
+#region - Resource Records
+
+Function Initialize-IPControlDeviceResourceRecordExport {
+    <#
+
+    .SYNOPSIS
+    Initializes (begins) the process to Export Device Resource Records on an IPControl instance
+
+    .DESCRIPTION
+    Initializes (begins) the process to Export Device Resource Records on an IPControl instance
+
+    .PARAMETER Device
+    Mandatory [Device] object representing the Device whose resource records are to be exported. Use Get-IPControlDevice to retrieve these.
+
+    .INPUTS
+    Device objects from Get-IPControlDevice
+
+    .OUTPUTS
+    A [initExportDevice] object will be returned for use with exporting.
+
+    .EXAMPLE
+    Initialize-IPControlDeviceResourceRecordExport -Device $Device
+
+    .NOTES
+    Exports cannot occur without first initializing.
+
+    This function is not intended to be used standalone, rather it is part of the ? function set.
+
+    #>
+    [OutputType([initExportDevice])]
+    [CmdletBinding()]
+    Param (
+        [Parameter(Mandatory = $true)]
+        [Device]$Device,
+        [Parameter(Mandatory = $false)]
+        [int32]$pageSize = 0,
+        [Parameter(Mandatory = $false)]
+        [int32]$firstResultPos = 0
+    )
+    If ((Confirm-IPControlSession -Quiet) -ne $true) {
+        Write-Warning -Message "Please use Connect-IPControl to establish a new session"
+        Break
+    }
+    [string]$Method = 'POST'
+    [string]$Command = '/Exports/initExportDeviceResourceRec'
+    [hashtable]$parameters = @{}
+    $parameters.Add('Method', $Method)
+    $parameters.Add('Command', $Command)
+    $parameters.Add('ContentType', 'application/json')
+    [string]$device_ip_address = $Device.ipAddress
+    [string]$device_container = $Device.container
+    If ($device_ip_address.Length -eq 0) {
+        Write-Warning -Message "Somehow the IP address of the Device is empty"
+        Break
+    }
+    ElseIf ($device_container.Length -eq 0) {
+        Write-Warning -Message "Somehow the Container of the Device is empty"
+        Break
+    }
+    [string]$Body = @{filter = "IPAddress=$device_ip_address"; pageSize = $pageSize; firstResultPos = $firstResultPos; } | ConvertTo-Json -Compress
+    #[string]$Body = @{filter = "IPAddress=$device_ip_address"; } | ConvertTo-Json -Compress
+    $parameters.Add('Body', $Body)
+    $Error.Clear()
+    Try {
+        [PSCustomObject]$results = Invoke-IPControlAPI @parameters
+    }
+    Catch {
+        [string]$Message = $_.Exception.Message
+        Write-Warning -Message "Invoke-IPControlAPI failed to execute [$Command] due to [$Message]."
+        Break
+    }
+    $Error.Clear()
+    Try {
+        [initExportDevice]$ipcontrol_init_export_device = $results | Select-Object -First 1
+    }
+    Catch {
+        [string]$Message = $_.Exception.Message
+        Write-Warning -Message "Failed to formulate the response from the API into an [initExportDevice] object under Initialize-IPControlDeviceResourceRecordExport due to [$Message]."
+        Break
+    }
+    Return $ipcontrol_init_export_device
+    End {
+
+    }
+}
+
+Function Complete-IPControlDeviceResourceRecordExport {
+    <#
+
+    .SYNOPSIS
+    Completes (finishes) the process to Export Device Resource Records on an IPControl instance
+
+    .DESCRIPTION
+    Completes (finishes) the process to Export Device Resource Records on an IPControl instance
+
+    .PARAMETER initExportDevice
+    Mandatory [initExportDevice] object representing the Device Export to be completed. Initialize-IPControlDeviceResourceRecordExport to create these.
+
+    .INPUTS
+    Device objects from Get-IPControlDevice
+
+    .OUTPUTS
+    None
+
+    .EXAMPLE
+    Initializes and then immediately closes a device resource record export request (for demonstration purposes)
+
+    $initExportDevice = Initialize-IPControlDeviceResourceRecordExport -Device (Get-IPControlDevice -IPAddress '1.2.3.4')
+    Complete-IPControlDeviceResourceRecordExport -initExportDevice $initExportDevice
+
+    .NOTES
+    Export sessions that were started with Initialize-IPControlDeviceResourceRecordExport must subsequently be completed (closed) with Complete-IPControlDeviceResourceRecordExport
+
+    This function is not intended to be used standalone, rather it is part of the ? function set.
+
+    #>
+    [CmdletBinding()]
+    Param (
+        [Parameter(Mandatory = $true)]
+        [initExportDevice]$initExportDevice
+    )
+    If ((Confirm-IPControlSession -Quiet) -ne $true) {
+        Write-Warning -Message "Please use Connect-IPControl to establish a new session"
+        Break
+    }
+    [string]$Method = 'POST'
+    [string]$Command = '/Exports/endExportDeviceResourceRec'
+    [hashtable]$parameters = @{}
+    $parameters.Add('Method', $Method)
+    $parameters.Add('Command', $Command)
+    $parameters.Add('ContentType', 'application/json')
+    [hashtable]$context = @{}
+    [string]$device_ip_address = $initExportDevice.filter -replace 'IPAddress='
+    If ($device_ip_address -notmatch '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}') {
+        Write-Warning -Message "Somehow the IP address couldn't be extracted from the `$initExportDevice variable"
+        Break
+    }
+    [string]$contextId = $initExportDevice.contextId
+    If ($contextId.Length -eq 0) {
+        Write-Warning -Message "Somehow the Context Id couldn't be extracted from the `$initExportDevice variable"
+        Break
+    }
+    [int64]$firstResultPos = $initExportDevice.firstResultPos
+    [int64]$internalResultCount = $initExportDevice.internalResultCount
+    [int64]$maxResults = $initExportDevice.maxResults
+    [string]$query = $initExportDevice.query
+    [int64]$resultCount = $initExportDevice.resultCount
+    $context.Add('contextId', $contextId)
+    $context.Add('contextType', 'Export_Device')
+    $context.Add('filter', "IPAddress=$device_ip_address")
+    $context.Add('firstResultPos', $firstResultPos)
+    $context.Add('internalResultCount', $internalResultCount)
+    $context.Add('maxResults', $maxResults)
+    $context.Add('query', $query)
+    $context.Add('resultCount', $resultCount)
+    $context.Add('options', @($null))
+    [string]$Body = @{'context' = $context; } | ConvertTo-Json -Compress
+    $parameters.Add('Body', $Body)
+    $Error.Clear()
+    Try {
+        [PSCustomObject]$results = Invoke-IPControlAPI @parameters
+    }
+    Catch {
+        [string]$Message = $_.Exception.Message
+        Write-Warning -Message "Invoke-IPControlAPI failed to execute [$Command] due to [$Message]."
+        Break
+    }
+    If ($results.Content -eq 'null') {
+        Write-Verbose -Message "The $contextId session was cleaned up"
+    }
+}
+
+Function Get-IPControlDeviceResourceRecord {
+    <#
+
+    .SYNOPSIS
+    Gets the Resource Records from a Device on an IPControl instance
+
+    .DESCRIPTION
+    Gets the Resource Records from a Device on an IPControl instance
+
+    .PARAMETER Device
+    Mandatory [Device] object representing the Device whose resource records are to be retrieved. Use Get-IPControlDevice to obtain this.
+
+    .INPUTS
+    Device objects from Get-IPControlDevice
+
+    .OUTPUTS
+    Resource Record objects
+
+    .EXAMPLE
+    Gets the Resource Records from a Device with an IP address of '1.2.3.4'
+
+    Get-IPControlDeviceResourceRecord -Device (Get-IPControlDevice -IPAddress '1.2.3.4')
+
+    .NOTES
+
+    You must use Connect-IPControl to establish a connection and define the global session variable
+
+    #>
+    [OutputType([ResourceRecord[]])]
+    [CmdletBinding()]
+    Param (
+        [Parameter(Mandatory = $true)]
+        [Device]$Device
+    )
+    If ((Confirm-IPControlSession -Quiet) -ne $true) {
+        Write-Warning -Message "Please use Connect-IPControl to establish a new session"
+        Break
+    }
+    [string]$device_ip_address = $Device.ipAddress
+    If ($device_ip_address -notmatch '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}') {
+        Write-Warning -Message "Somehow the IP address couldn't be extracted from the `$Device variable"
+        Break
+    }
+
+    # Part 1 - Initialize the export
+    $Error.Clear()
+    Try {
+        [initExportDevice]$initExportDevice = Initialize-IPControlDeviceResourceRecordExport -Device $Device
+    }
+    Catch {
+        [string]$Message = $_.Exception.Message
+        Write-Warning -Message "Initialize-IPControlDeviceResourceRecordExport failed to execute against [$device_ip_address] due to [$Message]."
+        Break
+    }
+    [string]$contextId = $initExportDevice.contextId
+    If ($contextId.Length -eq 0) {
+        Write-Warning -Message "Somehow the Context Id couldn't be extracted from the `$Device variable"
+        Break
+    }
+    Write-Verbose -Message "Received back $contextId to start exporting resource records from $device_ip_address"
+
+    # Part 2 - Retrieve the export
+    [string]$Method = 'POST'
+    [string]$Command = '/Exports/exportDeviceResourceRec'
+    [hashtable]$parameters = @{}
+    $parameters.Add('Method', $Method)
+    $parameters.Add('Command', $Command)
+    $parameters.Add('ContentType', 'application/json')
+    [hashtable]$context = @{}
+    [int64]$firstResultPos = $initExportDevice.firstResultPos
+    [int64]$internalResultCount = $initExportDevice.internalResultCount
+    [int64]$maxResults = $initExportDevice.maxResults
+    [string]$query = $initExportDevice.query
+    [int64]$resultCount = $initExportDevice.resultCount
+    $context.Add('contextId', $contextId)
+    $context.Add('contextType', 'Export_Device')
+    $context.Add('filter', "IPAddress=$device_ip_address")
+    $context.Add('firstResultPos', $firstResultPos)
+    $context.Add('internalResultCount', $internalResultCount)
+    $context.Add('maxResults', $maxResults)
+    $context.Add('query', $query)
+    $context.Add('resultCount', $resultCount)
+    $context.Add('options', @($null))
+    [string]$Body = @{'context' = $context; } | ConvertTo-Json -Compress
+    $parameters.Add('Body', $Body)
+    $Error.Clear()
+    Try {
+        [PSCustomObject]$results = Invoke-IPControlAPI @parameters
+    }
+    Catch {
+        [string]$Message = $_.Exception.Message
+        Write-Warning -Message "Invoke-IPControlAPI failed to execute [$Command] due to [$Message]."
+        Break
+    }
+    # Part 3 - Close the export session
+    $Error.Clear()
+    Try {
+        Complete-IPControlDeviceResourceRecordExport -initExportDevice $initExportDevice
+    }
+    Catch {
+        [string]$Message = $_.Exception.Message
+        Write-Warning -Message "Complete-IPControlDeviceResourceRecordExport failed to execute against $contextId ($device_ip_address) due to [$Message]."
+        Break
+    }
+    $Error.Clear()
+    Try {
+        [ResourceRecord[]]$ipcontrol_records = $results
+    }
+    Catch {
+        [string]$Message = $_.Exception.Message
+        Write-Warning -Message "Failed to formulate the response from the API into [ResourceRecord] objects under Export-IPControlDeviceResourceRecord due to [$Message]."
+        Break
+    }
+    If ($ipcontrol_records.Count -gt 0) {
+        Return $ipcontrol_records
+    }
+}
+
+#endregion
+
+#Region = Utility Functions =
 
 Function ConvertTo-QueryString {
     <#
@@ -416,10 +1246,10 @@ Function Invoke-IPControlAPI {
     The reponse is provided in a PSCustomObject.
 
     .EXAMPLE
-    Invoke-IPControlAPI -Command '/Gets/getDeviceByIPAddr' -Method GET -Body getDeviceByIPAddr?ipAddress=1.2.3.4
+    Invoke-IPControlAPI -Command '/Gets/getDeviceByIPAddr' -Method GET -Body 'ipAddress=1.2.3.4'
 
     .NOTES
-    You must use Connect-IPControl to establish the token by way of global variable.
+    You must use Connect-IPControl to establish a connection and define the global session variable
 
     #>
 
@@ -428,7 +1258,7 @@ Function Invoke-IPControlAPI {
         [Parameter(Mandatory = $true)]
         [string]$Command,
         [Parameter(Mandatory = $true)]
-        [ValidateSet('GET', 'POST')]
+        [ValidateSet('GET', 'POST', 'DELETE')]
         [string]$Method,
         [Parameter(Mandatory = $false)]
         [switch]$NotSecure,
@@ -490,7 +1320,7 @@ Function Invoke-IPControlAPI {
     $parameters.Add('Method', $Method)
     $parameters.Add('ContentType', $ContentType)
     If ($null -ne $ipcontrol_session.Header) {
-        $parameters.Add('Headers', $ipcontrol_session.Header) # @($ipcontrol_session.Header)) , @{'Accept' = 'application/json'}
+        $parameters.Add('Headers', $ipcontrol_session.Header)
     }
     Else {
         Write-Warning -Message "How is it that the `$ipcontrol_session global variable does not contain a header?"
@@ -584,9 +1414,14 @@ Function Invoke-IPControlAPI {
             Write-Warning -Message $ReturnCodeWarning
             Break
         }
-        If ($return_code -gt 0) {
+        If (($return_code -eq 400) -and ($Command -match '\/[a-z]{1,}\/initExport[a-z]{1,}')) {
+            Write-Warning -Message 'If an initExport command is failing with 400 then the most likely reason is because you didn''t clean up your session. Please, clean up your session after initiating any exports.'
+            Break
+        }
+        ElseIf ($return_code -gt 0) {
             [string]$ReturnCodeWarning = Switch ($return_code) {
-                401 { "You received HTTP Code $return_code (Unauthorized). HAS YOUR TOKEN EXPIRED? ARE YOU ON THE CORRECT DOMAIN? :-)" }
+                400 { "You received HTTP Code $return_code (Bad Request). Most likely, the object you specified doesn't exist" }
+                401 { "You received HTTP Code $return_code (Unauthorized). HAS YOUR TOKEN EXPIRED? :-)" }
                 403 { "You received HTTP Code $return_code (Forbidden). DO YOU MAYBE NOT HAVE PERMISSION TO THIS? [$command]" }
                 404 { "You received HTTP Code $return_code (Page Not Found). ARE YOU SURE THIS ENDPOINT REALLY EXISTS? [$command]" }
                 Default { "You received HTTP Code $return_code instead of '200 OK'. Apparently, something is wrong..." }
@@ -612,57 +1447,55 @@ Function Invoke-IPControlAPI {
     Return $content_object
 }
 
-Function Get-IPControlDevice {
+Function Disconnect-IPControl {
     <#
-    
     .SYNOPSIS
-    Gets a device (a.k.a. an IP address) from an IPControl instance
+    Disconnects from the API of an IPControl instance
 
     .DESCRIPTION
-    Gets a device (a.k.a. an IP address) from an IPControl instance
-
-    .PARAMETER IPAddress
-    Mandatory string representing the device (IP address) to look up.
+    The `Disconnect-IPControl` function removes the global session variable object allowing a new one to be set.
 
     .INPUTS
-    None. You cannot pipe objects to Invoke-IPControlAPI (yet).
+    None. You cannot pipe objects to Disconnect-IPControl.
 
     .OUTPUTS
-    The reponse is provided in a PSCustomObject.
+    A string indicating the results of the disconnection attempt.
 
     .EXAMPLE
-    Invoke-IPControlAPI -Command '/Gets/getDeviceByIPAddr' -Method GET -Body getDeviceByIPAddr?ipAddress=1.2.3.4
+    Disconnect-IPControl
 
     .NOTES
-    You must use Connect-IPControl to establish the token by way of global variable.
+    The main purpose of this function is to remove the global session variable $ipcontrol_session
 
     #>
-    [OutputType([PSCustomObject])]
     [CmdletBinding()]
     Param(
-        [ValidateScript({ $_ -match '^[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}$' })]
-        [Parameter(Mandatory = $true)]
-        [string]$IPAddress
     )
-    [string]$Command = '/Gets/getDeviceByIPAddr'
-    [string]$Method = 'GET'
-    [hashtable]$parameters = @{}
-    [System.Collections.Specialized.OrderedDictionary]$BodyMetaData = [System.Collections.Specialized.OrderedDictionary]@{}
-    $BodyMetaData.Add('ipAddress', $IPAddress)
-    [string]$Body = ConvertTo-QueryString -InputObject $BodyMetaData
-    $parameters.Add('Body', $Body)
-    $parameters.Add('Method', $Method)
-    $parameters.Add('Command', $Command)
+    If ($null -eq $ipcontrol_session.Instance) {
+        Write-Warning -Message "You are not actually connected so you can't disconnect"
+        Break
+    }
+    [datetime]$ExpirationDate = $ipcontrol_session.ExpirationDate
     $Error.Clear()
     Try {
-        [PSCustomObject[]]$results = Invoke-IPControlAPI @parameters
+        Remove-Variable -Name ipcontrol_session -Scope Global -Force
     }
     Catch {
         [string]$Message = $_.Exception.Message
-        Write-Warning -Message "Invoke-IPControlAPI failed to execute [$Command] on [$Instance] due to [$Message]."
+        Write-Warning -Message "Remove-Variable failed to remove the expired ipcontrol_session global variable (under Disconnect-IPControl) due to [$Message]."
         Break
     }
-    If ($results.Count -gt 0) {
-        Return $results
+    If ($ExpirationDate -gt (Get-Date -Date '1970-01-01 00:00:00')) {
+        [datetime]$current_date = Get-Date
+        [timespan]$TimeRemaining = ($ExpirationDate - $current_date)
+        [int32]$SecondsRemaining = $TimeRemaining.TotalSeconds
+        If ($SecondsRemaining -lt 2) {
+            Write-Information -MessageData "Removed the already expired `$ipcontrol_session global variable from this session"
+        }
+        Else {
+            Write-Information -MessageData "Removed the non-expired `$ipcontrol_session global variable from this session (it had $SecondsRemaining seconds remaining)"
+        }
     }
 }
+
+#EndRegion

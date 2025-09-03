@@ -11,13 +11,13 @@ Developed and tested against IPControl Version 14.0 Build 48
 	RootModule             = 'IPControl.psm1'
 	
 	# Version number of this module.
-	ModuleVersion          = '1.0.0'
+	ModuleVersion          = '1.0.1'
 	
 	# ID used to uniquely identify this module
-	GUID                   = 'f7a2a3b9-0039-49f6-99c6-e26fb24e7c43'
+	GUID                   = '5a220bf8-526f-4805-b900-9fdd5da4ee21'
 	
 	# Copyright statement for this module
-	Copyright              = 'not affiliated with Cygna Labs Corp.'
+	Copyright              = 'not affiliated with Cygna Labs'
 	
 	# Description of the functionality provided by this module
 	Description            = 'Interact with the API of an IPControl instance'
@@ -62,7 +62,7 @@ Developed and tested against IPControl Version 14.0 Build 48
 	NestedModules          = @()
 	
 	# Functions to export from this module
-	FunctionsToExport      = @( 'Connect-IPControl', 'ConvertTo-QueryString', 'Invoke-IPControlAPI', 'Get-IPControlDevice' ) #For performance, list functions explicitly
+	FunctionsToExport      = @( 'Complete-IPControlDeviceResourceRecordExport', 'Confirm-IPControlSession', 'Connect-IPControl', 'ConvertTo-QueryString', 'Disconnect-IPControl', 'Get-IPControlContainer', 'Get-IPControlDevice', 'Get-IPControlDeviceResourceRecord', 'Initialize-IPControlDeviceResourceRecordExport', 'Invoke-IPControlAPI', 'Remove-IPControlDevice' ) #For performance, list functions explicitly
 
 	CompatiblePSEditions   = @('Desktop', 'Core')
 	
