@@ -43,7 +43,7 @@ Use `Connect-IPControl` to establish your session
 - The expiration date of the current token is now checked whenever invoking the API
 
 ### Detailed Change Log
-- New functions added: 'Complete-IPControlDeviceResourceRecordExport', 'Confirm-IPControlSession', 'Disconnect-IPControl', 'Get-IPControlContainer', 'Get-IPControlDeviceResourceRecord', 'Initialize-IPControlDeviceResourceRecordExport', 'Remove-IPControlDevice'
+- New functions added: `Complete-IPControlDeviceResourceRecordExport`, `Confirm-IPControlSession`, `Disconnect-IPControl`, `Get-IPControlContainer`, `Get-IPControlDeviceResourceRecord`, `Initialize-IPControlDeviceResourceRecordExport`, `Remove-IPControlDevice`
 - Added the `-Hostname`, `-MACAddress` and `-Id` parameters to `Get-AutomateNOWDevice`
 - Added pipeline capability to `Get-IPControlDevice`
 
