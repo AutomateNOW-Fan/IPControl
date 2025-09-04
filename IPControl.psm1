@@ -416,6 +416,57 @@ Function Connect-IPControl {
     }
 }
 
+Function Disconnect-IPControl {
+    <#
+    .SYNOPSIS
+    Disconnects from the API of an IPControl instance
+
+    .DESCRIPTION
+    The `Disconnect-IPControl` function removes the global session variable object allowing a new one to be set.
+
+    .INPUTS
+    None. You cannot pipe objects to Disconnect-IPControl.
+
+    .OUTPUTS
+    A string indicating the results of the disconnection attempt.
+
+    .EXAMPLE
+    Disconnect-IPControl
+
+    .NOTES
+    The main purpose of this function is to remove the global session variable $ipcontrol_session
+
+    #>
+    [CmdletBinding()]
+    Param(
+    )
+    If ($null -eq $ipcontrol_session.Instance) {
+        Write-Warning -Message "You are not actually connected so you can't disconnect"
+        Break
+    }
+    [datetime]$ExpirationDate = $ipcontrol_session.ExpirationDate
+    $Error.Clear()
+    Try {
+        Remove-Variable -Name ipcontrol_session -Scope Global -Force
+    }
+    Catch {
+        [string]$Message = $_.Exception.Message
+        Write-Warning -Message "Remove-Variable failed to remove the expired ipcontrol_session global variable (under Disconnect-IPControl) due to [$Message]."
+        Break
+    }
+    If ($ExpirationDate -gt (Get-Date -Date '1970-01-01 00:00:00')) {
+        [datetime]$current_date = Get-Date
+        [timespan]$TimeRemaining = ($ExpirationDate - $current_date)
+        [int32]$SecondsRemaining = $TimeRemaining.TotalSeconds
+        If ($SecondsRemaining -lt 2) {
+            Write-Information -MessageData "Removed the already expired `$ipcontrol_session global variable from this session"
+        }
+        Else {
+            Write-Information -MessageData "Removed the non-expired `$ipcontrol_session global variable from this session (it had $SecondsRemaining seconds remaining)"
+        }
+    }
+}
+
 Function Confirm-IPControlSession {
     [OutputType([boolean])]
     [CmdletBinding()]
@@ -884,177 +935,7 @@ Function Remove-IPControlDevice {
 
 #endregion
 
-#region - Resource Records
-
-Function Initialize-IPControlDeviceResourceRecordExport {
-    <#
-
-    .SYNOPSIS
-    Initializes (begins) the process to Export Device Resource Records on an IPControl instance
-
-    .DESCRIPTION
-    Initializes (begins) the process to Export Device Resource Records on an IPControl instance
-
-    .PARAMETER Device
-    Mandatory [Device] object representing the Device whose resource records are to be exported. Use Get-IPControlDevice to retrieve these.
-
-    .INPUTS
-    Device objects from Get-IPControlDevice
-
-    .OUTPUTS
-    A [initExportDevice] object will be returned for use with exporting.
-
-    .EXAMPLE
-    Initialize-IPControlDeviceResourceRecordExport -Device $Device
-
-    .NOTES
-    Exports cannot occur without first initializing.
-
-    This function is not intended to be used standalone, rather it is part of the ? function set.
-
-    #>
-    [OutputType([initExportDevice])]
-    [CmdletBinding()]
-    Param (
-        [Parameter(Mandatory = $true)]
-        [Device]$Device,
-        [Parameter(Mandatory = $false)]
-        [int32]$pageSize = 0,
-        [Parameter(Mandatory = $false)]
-        [int32]$firstResultPos = 0
-    )
-    If ((Confirm-IPControlSession -Quiet) -ne $true) {
-        Write-Warning -Message "Please use Connect-IPControl to establish a new session"
-        Break
-    }
-    [string]$Method = 'POST'
-    [string]$Command = '/Exports/initExportDeviceResourceRec'
-    [hashtable]$parameters = @{}
-    $parameters.Add('Method', $Method)
-    $parameters.Add('Command', $Command)
-    $parameters.Add('ContentType', 'application/json')
-    [string]$device_ip_address = $Device.ipAddress
-    [string]$device_container = $Device.container
-    If ($device_ip_address.Length -eq 0) {
-        Write-Warning -Message "Somehow the IP address of the Device is empty"
-        Break
-    }
-    ElseIf ($device_container.Length -eq 0) {
-        Write-Warning -Message "Somehow the Container of the Device is empty"
-        Break
-    }
-    [string]$Body = @{filter = "IPAddress=$device_ip_address"; pageSize = $pageSize; firstResultPos = $firstResultPos; } | ConvertTo-Json -Compress
-    #[string]$Body = @{filter = "IPAddress=$device_ip_address"; } | ConvertTo-Json -Compress
-    $parameters.Add('Body', $Body)
-    $Error.Clear()
-    Try {
-        [PSCustomObject]$results = Invoke-IPControlAPI @parameters
-    }
-    Catch {
-        [string]$Message = $_.Exception.Message
-        Write-Warning -Message "Invoke-IPControlAPI failed to execute [$Command] due to [$Message]."
-        Break
-    }
-    $Error.Clear()
-    Try {
-        [initExportDevice]$ipcontrol_init_export_device = $results | Select-Object -First 1
-    }
-    Catch {
-        [string]$Message = $_.Exception.Message
-        Write-Warning -Message "Failed to formulate the response from the API into an [initExportDevice] object under Initialize-IPControlDeviceResourceRecordExport due to [$Message]."
-        Break
-    }
-    Return $ipcontrol_init_export_device
-    End {
-
-    }
-}
-
-Function Complete-IPControlDeviceResourceRecordExport {
-    <#
-
-    .SYNOPSIS
-    Completes (finishes) the process to Export Device Resource Records on an IPControl instance
-
-    .DESCRIPTION
-    Completes (finishes) the process to Export Device Resource Records on an IPControl instance
-
-    .PARAMETER initExportDevice
-    Mandatory [initExportDevice] object representing the Device Export to be completed. Initialize-IPControlDeviceResourceRecordExport to create these.
-
-    .INPUTS
-    Device objects from Get-IPControlDevice
-
-    .OUTPUTS
-    None
-
-    .EXAMPLE
-    Initializes and then immediately closes a device resource record export request (for demonstration purposes)
-
-    $initExportDevice = Initialize-IPControlDeviceResourceRecordExport -Device (Get-IPControlDevice -IPAddress '1.2.3.4')
-    Complete-IPControlDeviceResourceRecordExport -initExportDevice $initExportDevice
-
-    .NOTES
-    Export sessions that were started with Initialize-IPControlDeviceResourceRecordExport must subsequently be completed (closed) with Complete-IPControlDeviceResourceRecordExport
-
-    This function is not intended to be used standalone, rather it is part of the ? function set.
-
-    #>
-    [CmdletBinding()]
-    Param (
-        [Parameter(Mandatory = $true)]
-        [initExportDevice]$initExportDevice
-    )
-    If ((Confirm-IPControlSession -Quiet) -ne $true) {
-        Write-Warning -Message "Please use Connect-IPControl to establish a new session"
-        Break
-    }
-    [string]$Method = 'POST'
-    [string]$Command = '/Exports/endExportDeviceResourceRec'
-    [hashtable]$parameters = @{}
-    $parameters.Add('Method', $Method)
-    $parameters.Add('Command', $Command)
-    $parameters.Add('ContentType', 'application/json')
-    [hashtable]$context = @{}
-    [string]$device_ip_address = $initExportDevice.filter -replace 'IPAddress='
-    If ($device_ip_address -notmatch '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}') {
-        Write-Warning -Message "Somehow the IP address couldn't be extracted from the `$initExportDevice variable"
-        Break
-    }
-    [string]$contextId = $initExportDevice.contextId
-    If ($contextId.Length -eq 0) {
-        Write-Warning -Message "Somehow the Context Id couldn't be extracted from the `$initExportDevice variable"
-        Break
-    }
-    [int64]$firstResultPos = $initExportDevice.firstResultPos
-    [int64]$internalResultCount = $initExportDevice.internalResultCount
-    [int64]$maxResults = $initExportDevice.maxResults
-    [string]$query = $initExportDevice.query
-    [int64]$resultCount = $initExportDevice.resultCount
-    $context.Add('contextId', $contextId)
-    $context.Add('contextType', 'Export_Device')
-    $context.Add('filter', "IPAddress=$device_ip_address")
-    $context.Add('firstResultPos', $firstResultPos)
-    $context.Add('internalResultCount', $internalResultCount)
-    $context.Add('maxResults', $maxResults)
-    $context.Add('query', $query)
-    $context.Add('resultCount', $resultCount)
-    $context.Add('options', @($null))
-    [string]$Body = @{'context' = $context; } | ConvertTo-Json -Compress
-    $parameters.Add('Body', $Body)
-    $Error.Clear()
-    Try {
-        [PSCustomObject]$results = Invoke-IPControlAPI @parameters
-    }
-    Catch {
-        [string]$Message = $_.Exception.Message
-        Write-Warning -Message "Invoke-IPControlAPI failed to execute [$Command] due to [$Message]."
-        Break
-    }
-    If ($results.Content -eq 'null') {
-        Write-Verbose -Message "The $contextId session was cleaned up"
-    }
-}
+#region - Device Resource Records
 
 Function Get-IPControlDeviceResourceRecord {
     <#
@@ -1174,7 +1055,181 @@ Function Get-IPControlDeviceResourceRecord {
     }
 }
 
+Function Initialize-IPControlDeviceResourceRecordExport {
+    <#
+
+    .SYNOPSIS
+    Initializes (begins) the process to Export Device Resource Records on an IPControl instance
+
+    .DESCRIPTION
+    Initializes (begins) the process to Export Device Resource Records on an IPControl instance
+
+    .PARAMETER Device
+    Mandatory [Device] object representing the Device whose resource records are to be exported. Use Get-IPControlDevice to retrieve these.
+
+    .INPUTS
+    Device objects from Get-IPControlDevice
+
+    .OUTPUTS
+    A [initExportDevice] object will be returned for use with exporting.
+
+    .EXAMPLE
+    Initialize-IPControlDeviceResourceRecordExport -Device $Device
+
+    .NOTES
+    Exports cannot occur without first initializing.
+
+    This function is not intended to be used standalone, rather it is part of the Get-IPControlResourceRecord function set.
+
+    #>
+    [OutputType([initExportDevice])]
+    [CmdletBinding()]
+    Param (
+        [Parameter(Mandatory = $true)]
+        [Device]$Device,
+        [Parameter(Mandatory = $false)]
+        [int32]$pageSize = 0,
+        [Parameter(Mandatory = $false)]
+        [int32]$firstResultPos = 0
+    )
+    If ((Confirm-IPControlSession -Quiet) -ne $true) {
+        Write-Warning -Message "Please use Connect-IPControl to establish a new session"
+        Break
+    }
+    [string]$Method = 'POST'
+    [string]$Command = '/Exports/initExportDeviceResourceRec'
+    [hashtable]$parameters = @{}
+    $parameters.Add('Method', $Method)
+    $parameters.Add('Command', $Command)
+    $parameters.Add('ContentType', 'application/json')
+    [string]$device_ip_address = $Device.ipAddress
+    [string]$device_container = $Device.container
+    If ($device_ip_address.Length -eq 0) {
+        Write-Warning -Message "Somehow the IP address of the Device is empty"
+        Break
+    }
+    ElseIf ($device_container.Length -eq 0) {
+        Write-Warning -Message "Somehow the Container of the Device is empty"
+        Break
+    }
+    [string]$Body = @{filter = "IPAddress=$device_ip_address"; pageSize = $pageSize; firstResultPos = $firstResultPos; } | ConvertTo-Json -Compress
+    #[string]$Body = @{filter = "IPAddress=$device_ip_address"; } | ConvertTo-Json -Compress
+    $parameters.Add('Body', $Body)
+    $Error.Clear()
+    Try {
+        [PSCustomObject]$results = Invoke-IPControlAPI @parameters
+    }
+    Catch {
+        [string]$Message = $_.Exception.Message
+        Write-Warning -Message "Invoke-IPControlAPI failed to execute [$Command] due to [$Message]."
+        Break
+    }
+    $Error.Clear()
+    Try {
+        [initExportDevice]$ipcontrol_init_export_device = $results | Select-Object -First 1
+    }
+    Catch {
+        [string]$Message = $_.Exception.Message
+        Write-Warning -Message "Failed to formulate the response from the API into an [initExportDevice] object under Initialize-IPControlDeviceResourceRecordExport due to [$Message]."
+        Break
+    }
+    Return $ipcontrol_init_export_device
+    End {
+
+    }
+}
+
+Function Complete-IPControlDeviceResourceRecordExport {
+    <#
+
+    .SYNOPSIS
+    Completes (finishes) the process to Export Device Resource Records on an IPControl instance
+
+    .DESCRIPTION
+    Completes (finishes) the process to Export Device Resource Records on an IPControl instance
+
+    .PARAMETER initExportDevice
+    Mandatory [initExportDevice] object representing the Device Export to be completed. Initialize-IPControlDeviceResourceRecordExport to create these.
+
+    .INPUTS
+    Device objects from Get-IPControlDevice
+
+    .OUTPUTS
+    None
+
+    .EXAMPLE
+    Initializes and then immediately closes a device resource record export request (for demonstration purposes)
+
+    $initExportDevice = Initialize-IPControlDeviceResourceRecordExport -Device (Get-IPControlDevice -IPAddress '1.2.3.4')
+    Complete-IPControlDeviceResourceRecordExport -initExportDevice $initExportDevice
+
+    .NOTES
+    Export sessions that were started with Initialize-IPControlDeviceResourceRecordExport must subsequently be completed (closed) with Complete-IPControlDeviceResourceRecordExport
+
+    This function is not intended to be used standalone, rather it is part of the ? function set.
+
+    You must use Connect-IPControl to establish a connection and define the global session variable
+
+    #>
+    [CmdletBinding()]
+    Param (
+        [Parameter(Mandatory = $true)]
+        [initExportDevice]$initExportDevice
+    )
+    If ((Confirm-IPControlSession -Quiet) -ne $true) {
+        Write-Warning -Message "Please use Connect-IPControl to establish a new session"
+        Break
+    }
+    [string]$Method = 'POST'
+    [string]$Command = '/Exports/endExportDeviceResourceRec'
+    [hashtable]$parameters = @{}
+    $parameters.Add('Method', $Method)
+    $parameters.Add('Command', $Command)
+    $parameters.Add('ContentType', 'application/json')
+    [hashtable]$context = @{}
+    [string]$device_ip_address = $initExportDevice.filter -replace 'IPAddress='
+    If ($device_ip_address -notmatch '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}') {
+        Write-Warning -Message "Somehow the IP address couldn't be extracted from the `$initExportDevice variable"
+        Break
+    }
+    [string]$contextId = $initExportDevice.contextId
+    If ($contextId.Length -eq 0) {
+        Write-Warning -Message "Somehow the Context Id couldn't be extracted from the `$initExportDevice variable"
+        Break
+    }
+    [int64]$firstResultPos = $initExportDevice.firstResultPos
+    [int64]$internalResultCount = $initExportDevice.internalResultCount
+    [int64]$maxResults = $initExportDevice.maxResults
+    [string]$query = $initExportDevice.query
+    [int64]$resultCount = $initExportDevice.resultCount
+    $context.Add('contextId', $contextId)
+    $context.Add('contextType', 'Export_Device')
+    $context.Add('filter', "IPAddress=$device_ip_address")
+    $context.Add('firstResultPos', $firstResultPos)
+    $context.Add('internalResultCount', $internalResultCount)
+    $context.Add('maxResults', $maxResults)
+    $context.Add('query', $query)
+    $context.Add('resultCount', $resultCount)
+    $context.Add('options', @($null))
+    [string]$Body = @{'context' = $context; } | ConvertTo-Json -Compress
+    $parameters.Add('Body', $Body)
+    $Error.Clear()
+    Try {
+        [PSCustomObject]$results = Invoke-IPControlAPI @parameters
+    }
+    Catch {
+        [string]$Message = $_.Exception.Message
+        Write-Warning -Message "Invoke-IPControlAPI failed to execute [$Command] due to [$Message]."
+        Break
+    }
+    If ($results.Content -eq 'null') {
+        Write-Verbose -Message "The $contextId session was cleaned up"
+    }
+}
+
 #endregion
+
+#EndRegion
 
 #Region = Utility Functions =
 
@@ -1447,55 +1502,5 @@ Function Invoke-IPControlAPI {
     Return $content_object
 }
 
-Function Disconnect-IPControl {
-    <#
-    .SYNOPSIS
-    Disconnects from the API of an IPControl instance
 
-    .DESCRIPTION
-    The `Disconnect-IPControl` function removes the global session variable object allowing a new one to be set.
 
-    .INPUTS
-    None. You cannot pipe objects to Disconnect-IPControl.
-
-    .OUTPUTS
-    A string indicating the results of the disconnection attempt.
-
-    .EXAMPLE
-    Disconnect-IPControl
-
-    .NOTES
-    The main purpose of this function is to remove the global session variable $ipcontrol_session
-
-    #>
-    [CmdletBinding()]
-    Param(
-    )
-    If ($null -eq $ipcontrol_session.Instance) {
-        Write-Warning -Message "You are not actually connected so you can't disconnect"
-        Break
-    }
-    [datetime]$ExpirationDate = $ipcontrol_session.ExpirationDate
-    $Error.Clear()
-    Try {
-        Remove-Variable -Name ipcontrol_session -Scope Global -Force
-    }
-    Catch {
-        [string]$Message = $_.Exception.Message
-        Write-Warning -Message "Remove-Variable failed to remove the expired ipcontrol_session global variable (under Disconnect-IPControl) due to [$Message]."
-        Break
-    }
-    If ($ExpirationDate -gt (Get-Date -Date '1970-01-01 00:00:00')) {
-        [datetime]$current_date = Get-Date
-        [timespan]$TimeRemaining = ($ExpirationDate - $current_date)
-        [int32]$SecondsRemaining = $TimeRemaining.TotalSeconds
-        If ($SecondsRemaining -lt 2) {
-            Write-Information -MessageData "Removed the already expired `$ipcontrol_session global variable from this session"
-        }
-        Else {
-            Write-Information -MessageData "Removed the non-expired `$ipcontrol_session global variable from this session (it had $SecondsRemaining seconds remaining)"
-        }
-    }
-}
-
-#EndRegion
